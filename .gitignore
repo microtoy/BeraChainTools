@@ -5,3 +5,4 @@
 /private_run/
 /ym_bera.py
 .env
+*.txt

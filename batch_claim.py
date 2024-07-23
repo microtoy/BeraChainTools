@@ -1,4 +1,3 @@
-
 import time
 import asyncio
 import json
@@ -61,13 +60,17 @@ def get_yescaptcha_turnstile_token():
                  "task": {"websiteURL": "https://bartio.faucet.berachain.com/",
                           "websiteKey": "0x4AAAAAAARdAuciFArKhVwt",
                           "type": "TurnstileTaskProxylessM1"}, "softID": 109}
-    
-    response = requests.post('https://api.yescaptcha.com/createTask', json=json_data)
-    response_json = response.json()
-    if response_json['errorId'] != 0:
-        logger.warning(response_json)
+    try:
+        response = requests.post('https://api.yescaptcha.com/createTask', json=json_data)
+        response_json = response.json()
+        if response_json['errorId'] != 0:
+            logger.warning(response_json)
+            return False
+        task_id = response_json['taskId']
+    except Exception as e:
+        print(e)
         return False
-    task_id = response_json['taskId']
+
     for _ in range(120):
         try:
             data = {"clientKey": client_key, "taskId": task_id}
@@ -109,18 +112,26 @@ def claim_faucet(address: Union[Address, ChecksumAddress], google_token: str) ->
     params = {'address': address}
     print("going to check the IP in claim_faucet, should be the same.")
     is_proxy_working()
-    response = requests.post('https://bartio-faucet.berachain-devnet.com/api/claim', headers=headers,
-                             data=json.dumps(params), params=params)
-    response_text = response.text
-    print("claim_faucet response_text:", response_text)
 
-    if 'Added' in response_text:
-        logger.success(response_text)
-        write_to_file(address)
-        return True
-    else:
-        logger.warning(response_text.replace('\n', ''))
-        return False
+    for attempt in range(5):  # Try up to 5 times
+        try:
+            response = requests.post('https://bartio-faucet.berachain-devnet.com/api/claim', headers=headers,
+                                 data=json.dumps(params), params=params)
+            response_text = response.text
+            print("claim_faucet response_text:", response_text)
+
+            if 'Added' in response_text:
+                logger.success(response_text)
+                write_to_file(address)
+                return True
+            else:
+                logger.warning(response_text.replace('\n', ''))
+                time.sleep(2)  # Wait before the next attempt
+        except Exception as e:
+            print(e)  
+            time.sleep(1)      
+        
+    return False  # Return False if all attempts fail
 
 def claim(address: Union[Address, ChecksumAddress]) -> bool:
     google_token = get_yescaptcha_turnstile_token()
@@ -131,15 +142,14 @@ def claim(address: Union[Address, ChecksumAddress]) -> bool:
 
 
 async def run(file_path):
-    sem = asyncio.Semaphore(max_concurrent)
+    #sem = asyncio.Semaphore(max_concurrent)
     address_list = read_to_file(file_path)
 
     async def claim_wrapper(address):
-        async with sem:
-            logger.info(f"Going to claim for address: {address}")
-            claim_result = claim(address)
-            logger.info(f"Done for {address}, result is {claim_result}")
-            return claim_result
+        logger.info(f"Going to claim for address: {address}")
+        claim_result = claim(address)
+        logger.info(f"Done for {address}, result is {claim_result}")
+        return claim_result
 
     for address in address_list:
         switch_result = select_proxy()
@@ -149,23 +159,37 @@ async def run(file_path):
                 logger.success(f"Got money for address: {address}")
 
 
-def is_proxy_working():
-    test_url = "https://ipinfo.io/json"
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def fetch_url(url):
     try:
-        print(f"Testing proxy.")
-        response = requests.get(test_url, timeout = 15)
-        print(f"Response status code: {response.status_code}")
+        response = requests.get(url, timeout=5)  # 将超时时间减少到5秒
         if response.status_code == 200:
             ip_address = response.json().get("ip")
-            print(f"Current IP address: {ip_address}")
             return ip_address
-        else:
-            return False
-    except requests.RequestException as e:
-        print(f"RequestException occurred: {e}")
-    except requests.Timeout as e:
-        print(f"Timeout occurred: {e}")
+    except requests.RequestException:
+        pass
+    return None
+
+def is_proxy_working():
+    test_urls = [
+        "https://ipinfo.io/json",
+        "https://ipwhois.app/json/",
+        "https://api.ipify.org?format=json"
+    ]
+
+    with ThreadPoolExecutor() as executor:
+        future_to_url = {executor.submit(fetch_url, url): url for url in test_urls}
+        for future in as_completed(future_to_url):
+            ip_address = future.result()
+            if ip_address:
+                print(f"Current IP address: {ip_address}")
+                return ip_address
+    
+    print("All test URLs failed.")
     return False
+
 
 def select_proxy():
     global used_proxies, used_ips
@@ -174,13 +198,23 @@ def select_proxy():
     selector = selectors[selector_index - 1] if 0 < selector_index <= len(selectors) else None
     if selector:
         response = api.clash_request(f"{api.base_url}/proxies")
-        proxies = response.json()["proxies"][selector]["all"][5:]
-        for proxy in proxies:
+        proxies = response.json()["proxies"][selector]["all"]
+
+        # Determine the starting index based on the last used proxy
+        if used_proxies:
+            last_used_proxy = list(used_proxies)[-1]
+            start_index = proxies.index(last_used_proxy) + 1 if last_used_proxy in proxies else 3
+        else:
+            start_index = 3
+
+        # Iterate through proxies starting from the determined index
+        for i in range(start_index, len(proxies)):
+            proxy = proxies[i]
             if proxy not in used_proxies:
                 print(f"Switching to proxy: {proxy} for selector: {selector}")
                 try:
                     api.switch_proxy(selector, proxy)
-                    print("going to check the IP in select proxy, the first time of this IP.")
+                    print("Going to check the IP in select proxy, the first time of this IP.")
                     ip_address = is_proxy_working()
                     if ip_address and ip_address not in used_ips:
                         used_proxies.add(proxy)
@@ -194,11 +228,49 @@ def select_proxy():
                 except Exception as e:
                     print(f"Error switching proxy: {e}")
                     continue
+
+        # If no proxies were found from the starting index, iterate from the beginning
+        for i in range(3, start_index):
+            proxy = proxies[i]
+            if proxy not in used_proxies:
+                print(f"Switching to proxy: {proxy} for selector: {selector}")
+                try:
+                    api.switch_proxy(selector, proxy)
+                    print("Going to check the IP in select proxy, the first time of this IP.")
+                    ip_address = is_proxy_working()
+                    if ip_address and ip_address not in used_ips:
+                        used_proxies.add(proxy)
+                        used_ips.add(ip_address)
+                        save_used_proxies(used_proxies)
+                        save_used_ips(used_ips)
+                        print(f"Proxy {proxy} with IP {ip_address} is working")
+                        return True
+                    else:
+                        print(f"Proxy {proxy} with IP {ip_address} is not working or IP is already used")
+                except Exception as e:
+                    print(f"Error switching proxy: {e}")
+                    continue
+        
         print("No available proxies found.")
         return False
     else:
         return False
 
+
+
+def reset_and_run():
+    global used_proxies, used_ips
+    #save_used_proxies(used_proxies)
+    #save_used_ips(used_ips)
+    with open('claim_success.txt', 'r') as f:
+        claim_success_addresses = f.read().splitlines()
+    with open('address.txt', 'r') as f:
+        address_addresses = f.read().splitlines()
+    if set(claim_success_addresses) == set(address_addresses):
+        with open('claim_success.txt', 'w') as f:
+            f.truncate(0)
+    _file_path = 'address.txt'
+    asyncio.run(run(_file_path))
 
 if __name__ == '__main__':
     # 验证平台key
@@ -206,7 +278,8 @@ if __name__ == '__main__':
     # 目前支持使用yescaptcha 2captcha
     solver_provider = 'yescaptcha'
     # 并发数量
-    max_concurrent = 128
     # 读取文件的路径 地址一行一个
-    _file_path = 'address.txt'
-    asyncio.run(run(_file_path))
+    while True:
+        #time.sleep(8 * 60 * 60 + 30 * 60)  # 每8小时30分钟重置并重新运行
+
+        reset_and_run()
